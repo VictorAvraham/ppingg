@@ -1,107 +1,80 @@
 ---
 name: process-video-requests
-description: Poll the ppingg Base44 app for pending VideoRequest records (status "send"), generate a 15-second English TV commercial for each with Higgsfield Seedance 2.0, and write the video URL back. Use when asked to process pending ad requests, check for new video requests, or run the ppingg TV-ad pipeline.
+description: Process the ppingg TV-ad queue - pick up queued AgentVideoJob records from the Base44 app, generate a 15-second English TV commercial with Higgsfield Seedance 2.0 via MCP, and write the video URL back. Use when asked to process pending ad requests, check the video queue, or run the ppingg TV-ad pipeline.
 ---
 
-# Process ppingg VideoRequests
+# Process ppingg TV-ad queue (AgentVideoJob)
 
 Constants:
 - `appId`: `6910d4f137ee558974131c2c` (app: "PPNIGG - Connected TV to your perfect customer")
-- Video model: `seedance_2_0` ONLY (never substitute another model without the owner's approval)
-- Output: 15 seconds, 16:9, native audio ON, English voiceover
-- Default resolution: `720p` std (production upgrade to `1080p` only after owner approves)
+- Video model: `seedance_2_0` via Higgsfield MCP ONLY (owner requirement — never substitute)
+- Output: 15 seconds, 16:9, native audio ON (English announcer voiceover), 720p std
+  (production may upgrade resolution only with owner approval)
+- Cost reference: ~67.5 credits per 15s std 720p video. ALWAYS preflight with `get_cost: true`
+  and abort + warn the owner if remaining balance < cost.
 
-## 1. Fetch pending requests
+## How the app side works (already deployed in Base44)
 
-`mcp__base44__query_entities` on entity `VideoRequest` with
-`query: {"status": "send"}`, `sort: "created_date"`.
+- Admin CRM ("Request New Video") and the customer journey (BuildVideo page) both call the
+  `createVideoDirect` backend function.
+- `createVideoDirect` runs `generateAdScript` (LLM brain → motion prompt + English
+  `voiceover_script` ending with the spoken CTA), generates an opening-frame concept image,
+  then **enqueues an `AgentVideoJob` record** (`status: "queued"`) with the full Seedance
+  prompt, and returns an `agent-<uuid>` ticket as `video_id`.
+- Frontends poll `getVideoStatus` which resolves `agent-` tickets from `AgentVideoJob`.
+- `syncPendingVideos` completes `VideoRequest` records with `agent-` tickets app-side
+  (sets `done`, updates `User.videoUrls` / `lastVideoUrl`, logs activity).
 
-Skip (and do NOT bill credits for):
-- Duplicates: same `businessName` + another pending/processing/done record newer than it —
-  mark `status: "error"`, `errorMessage: "duplicate request"`.
-- Records the owner explicitly parked (check `adminNotes`).
+## Agent loop (this is your job)
 
-## 2. Validate each request
+1. **Fetch queue**: `mcp__base44__query_entities` on `AgentVideoJob`,
+   `query: {"status": "queued"}`, `sort: "created_date"`.
+   Skip any job whose `errorMessage` mentions "smoke test".
+2. **Claim**: set `status: "generating"` (`$set` via `mcp__base44__update_entities`,
+   query by `ticketId`) BEFORE generating, so a parallel run never double-bills.
+3. **Media**: `mcp__higgsfield__media_import_url` on `sourceImageUrl` → role `start_image`.
+   If `logoUrl` is a real raster logo (not favicon/placeholder), import → role `image_references`.
+4. **Preflight cost**: `mcp__higgsfield__generate_video` with `get_cost: true` and the exact
+   params below. Check `mcp__higgsfield__balance` covers it; otherwise set the job back to
+   `queued` and alert the owner.
+5. **Generate**:
+   ```json
+   {"params": {
+     "model": "seedance_2_0",
+     "prompt": "<job.prompt — already contains motion + voiceover>",
+     "duration": 15,
+     "aspect_ratio": "16:9",
+     "resolution": "720p",
+     "generate_audio": true,
+     "count": 1,
+     "medias": [
+       {"role": "start_image", "value": "<media_id of sourceImageUrl>"},
+       {"role": "image_references", "value": "<media_id of logo, if usable>"}
+     ]
+   }}
+   ```
+6. **Poll** the returned job until complete (typically several minutes).
+7. **Write back** on success (`$set` on the AgentVideoJob by `ticketId`):
+   `status: "done"`, `videoUrl`, `higgsfieldJobId`, `creditsSpent`.
+   Also update the matching `VideoRequest` (query `{"externalRequestId": "<ticketId>"}`):
+   `status: "done"`, `videoUrl` — belt-and-braces alongside `syncPendingVideos`.
+   On failure: `status: "error"`, `errorMessage` on both records.
+8. **Log**: create a `UserActivityLog` record — `eventType: "VideoReceivedSuccess"` /
+   `"VideoReceivedError"`, `relatedEntityId`, `userId`/`userEmail` from the job,
+   `details` JSON with higgsfield job id + credits.
+9. **Report** to the owner (Hebrew): business name, video URL, credits spent,
+   remaining balance.
 
-Required to proceed: `businessName`. Everything else is optional but shapes the ad:
-- `businessPresence` = `physical` or `both` AND `businessAddress` non-empty → end-card shows the address.
-- Otherwise → CTA is "Search us on Google" + exact business name.
-- `logoUrl`: import with `mcp__higgsfield__media_import_url` and pass as `image_references`.
-  If the URL is a generic site-builder placeholder or a tiny favicon (<100px), skip the logo
-  rather than shipping a blurry mark.
-- Use `summary` + `businessType` + `websiteUrl` for the creative concept.
+## Legacy queue
 
-Mark the record `status: "waiting"` (`$set`) before generating, so a second agent run
-never double-bills the same request.
+Old `VideoRequest` records in `status: "send"` (created before 2026-07-05, e.g. CandidaFree,
+GLOVESLINE ×2, Karavel ×4, John's of Bleecker ×2, Super Duper) have NO AgentVideoJob and NO
+prompt. Do NOT process them without explicit owner approval — several are duplicates or have
+placeholder logos. If approved: build the prompt yourself per the structure in `job.prompt`
+examples (hook → value scenes → end card with logo/name/address + "Search us on Google",
+English VO ≤35 words), then follow steps 3-9, updating the VideoRequest directly.
 
-## 3. Write the 15-second script
+## Watcher
 
-English only. Structure (Seedance 2.0 takes the whole thing as one prompt):
-
-- 0-3 s — Hook: one vivid scene that captures the business's core promise.
-- 3-10 s — 2 quick scenes showing product/service in action, real-world setting.
-- 10-15 s — End card: business logo, business name in large text, CTA voiceover.
-
-Voiceover: warm, confident announcer, max ~35 spoken words total, written in
-double quotes inside the prompt so Seedance lip-syncs/narrates it.
-
-CTA rules (owner requirement):
-- Always spoken: `"<Business Name> — search us on Google."`
-- On-screen end card: business name + logo (if usable) + address (only if physical presence).
-
-Prompt skeleton:
-
-```
-15-second polished TV commercial for "<BusinessName>", a <businessType>. <one-line summary>.
-Scene 1 (0-3s): <hook scene>. Scene 2 (3-7s): <scene>. Scene 3 (7-10s): <scene>.
-Scene 4 (10-15s): end card on clean background — the business logo and the name
-"<BusinessName>" in bold text<, address "<businessAddress>" below it>.
-Warm confident male/female announcer voiceover throughout: "<VO line 1> <VO line 2>
-<BusinessName> — search us on Google."
-Broadcast quality, bright commercial lighting, smooth camera moves, upbeat background music.
-```
-
-## 4. Generate
-
-`mcp__higgsfield__generate_video` with:
-
-```json
-{"params": {
-  "model": "seedance_2_0",
-  "prompt": "<script prompt>",
-  "duration": 15,
-  "aspect_ratio": "16:9",
-  "resolution": "720p",
-  "generate_audio": true,
-  "count": 1,
-  "medias": [{"role": "image_references", "value": "<media_id from media_import_url>"}]
-}}
-```
-
-- Preflight with `get_cost: true` first; abort and warn the owner if remaining credits < cost.
-- Generation is async — poll the returned job until complete (job id also viewable via
-  `mcp__higgsfield__job_display`). Typical wait: several minutes.
-
-## 5. Write back to ppingg
-
-On success (`mcp__base44__update_entities`, query by record `id`):
-
-```json
-{"$set": {"status": "done", "videoUrl": "<result mp4 url>", "externalRequestId": "<higgsfield job id>"}}
-```
-
-On failure:
-
-```json
-{"$set": {"status": "error", "errorMessage": "<reason>"}}
-```
-
-Then append a `UserActivityLog` record (`mcp__base44__create_entities`):
-`eventType: "VideoReceivedSuccess"` (or `VideoReceivedError`), `status: "success"|"failed"`,
-`relatedEntityId: <VideoRequest id>`, `userId`/`userEmail` copied from the request,
-`details`: JSON string with job id, credits spent, model.
-
-## 6. Report
-
-Tell the owner: which requests were processed, credits spent, remaining balance
-(`mcp__higgsfield__balance`), and the video URLs.
+While a session is live, poll every ~2 minutes (in-session cron). In-session crons DIE on
+session restart — after any restart, re-arm the watcher and CronList to verify.

@@ -4,15 +4,24 @@ Automation agent that connects the **ppingg** app (built on Base44) to **Higgsfi
 
 ## What it does
 
-1. Watches the `VideoRequest` entity in the ppingg Base44 app (`PPNIGG - Connected TV to your perfect customer`, appId `6910d4f137ee558974131c2c`) for records with `status: "send"`.
-2. Validates the business data (name, type, summary, address, logo).
-3. Writes a 15-second English TV-commercial script with voiceover and a CTA
-   ("Search us on Google" / business name + logo + address).
-4. Generates the video with **Seedance 2.0 only** (`seedance_2_0`) via the Higgsfield MCP,
-   16:9, 15 s, native audio (voiceover) enabled.
-5. Writes the result back to the same `VideoRequest` record:
-   `videoUrl`, `externalRequestId`, `status: "done"` (or `status: "error"` + `errorMessage`),
-   and appends a `UserActivityLog` record.
+Every "create ad" action in ppingg — the admin CRM button or the customer journey — flows
+through one pipeline (deployed in the Base44 app on 2026-07-05):
+
+1. `createVideoDirect` (Base44 backend function) builds the creative: `generateAdScript`
+   produces a cinematic motion prompt + an **English announcer voiceover ending with the
+   spoken CTA** ("Search us on Google" / brand + address), and an AI opening-frame image
+   is generated for the business.
+2. The function **enqueues an `AgentVideoJob`** record (`status: "queued"`) and returns an
+   `agent-<uuid>` ticket to the frontend — which keeps polling `getVideoStatus` unchanged.
+3. **This agent** picks up queued jobs, generates the video with **Seedance 2.0 only**
+   (`seedance_2_0` via the Higgsfield MCP — 15 s, 16:9, native audio, 720p), and writes
+   `videoUrl` + `status: "done"` back to the job.
+4. `getVideoStatus` / `syncPendingVideos` resolve `agent-` tickets from the queue, complete
+   the `VideoRequest`, update the user's video list, and log activity.
+
+The legacy path (Kling 3.0, 5 s, no voiceover, via `platform.higgsfield.ai`) was replaced:
+the old platform API only exposes Seedance 1.x (max 12 s), so Seedance 2.0 runs through the
+Higgsfield MCP on the agent side.
 
 ## Architecture
 
@@ -21,7 +30,7 @@ standalone server in this repo:
 
 | Side | Connection | Auth |
 |------|-----------|------|
-| ppingg / Base44 | Base44 MCP connector (`query_entities`, `update_entities`, `create_entities`) | Base44 account OAuth |
+| ppingg / Base44 | Base44 MCP connector (`query_entities`, `update_entities`, file/deploy tools) | Base44 account OAuth |
 | Higgsfield | `https://mcp.higgsfield.ai/mcp` connector (`generate_video`, `media_import_url`) | Higgsfield account OAuth |
 
 The full operating procedure lives in
