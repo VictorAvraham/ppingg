@@ -35,8 +35,13 @@ Constants:
 3. **Media**: `mcp__higgsfield__media_import_url` on `sourceImageUrl` → role `start_image`.
    If `logoUrl` is a real raster logo (not favicon/placeholder), import → role `image_references`.
 4. **Preflight cost**: `mcp__higgsfield__generate_video` with `get_cost: true` and the exact
-   params below. Check `mcp__higgsfield__balance` covers it; otherwise set the job back to
-   `queued` and alert the owner.
+   params below. Check `mcp__higgsfield__balance` covers it. If credits are insufficient:
+   - Set the job back to `status: "queued"` (do not consume it).
+   - Invoke the app's admin alert so the team gets an email via Resend:
+     `POST https://ad-craft-tv-copy-74131c2c.base44.app/api/functions/alertAdminLowCredits`
+     with header `api_key: <BASE44_API_KEY>` and body
+     `{"creditsRemaining": <balance>, "creditsNeeded": <cost>, "serialNumber": "<job serial>", "businessName": "<name>"}`.
+   - Tell the owner in chat, then stop (the job stays queued and resumes automatically after top-up).
 5. **Generate**:
    ```json
    {"params": {
